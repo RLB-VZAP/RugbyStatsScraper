@@ -1,11 +1,15 @@
 import json
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
+import app.api.players as players_api
 from app.api.players import load_players
 from app.core.config import get_settings
 from app.main import app
+from app.models.player import Player
+from app.scraper import ScraperError
 
 client = TestClient(app)
 
@@ -86,3 +90,107 @@ def test_serves_the_exported_file_when_there_is_one(monkeypatch, tmp_path):
 
     assert [player["playerName"] for player in body] == ["Handre Pollard"]
     assert set(body[0].keys()) == PLAYER_KEYS
+
+
+def _make_player(name: str) -> Player:
+    return Player(
+        club_id=UUID("33333333-3333-3333-3333-333333333333"),
+        position_id=UUID("44444444-4444-4444-4444-444444444444"),
+        player_name=name,
+        value=5.0,
+        attacking_ability=80,
+        defensive_ability=75,
+        kicking_ability=70,
+        discipline=85,
+        consistency=78,
+        fitness=90,
+        current_form=82,
+    )
+
+
+@pytest.fixture
+def fake_scrape(monkeypatch):
+    """Replace the live scrape so tests never touch the network."""
+
+    def _install(players):
+        async def _scrape(club, season):
+            _install.calls.append((club, season))
+            return players
+
+        _install.calls = []
+        monkeypatch.setattr(players_api, "_scrape_players", _scrape)
+        return _install
+
+    return _install
+
+
+def test_refresh_returns_freshly_scraped_players(no_export, fake_scrape):
+    fake_scrape([_make_player("Siya Kolisi")])
+
+    body = client.get("/players", params={"refresh": "true"}).json()
+
+    assert [player["playerName"] for player in body] == ["Siya Kolisi"]
+    assert set(body[0].keys()) == PLAYER_KEYS
+
+
+def test_full_refresh_persists_the_snapshot(monkeypatch, tmp_path, fake_scrape):
+    export = tmp_path / "players.json"
+    monkeypatch.setenv("URC_PLAYERS_FILE", str(export))
+    fake_scrape([_make_player("Pieter-Steph du Toit")])
+
+    client.get("/players", params={"refresh": "true"})
+
+    # The scrape was written to the snapshot, so a plain read now serves it.
+    assert export.exists()
+    body = client.get("/players").json()
+    assert [player["playerName"] for player in body] == ["Pieter-Steph du Toit"]
+
+
+def test_scoped_refresh_does_not_clobber_the_snapshot(
+    monkeypatch, tmp_path, fake_scrape
+):
+    export = tmp_path / "players.json"
+    export.write_text(
+        json.dumps(
+            [
+                {
+                    "clubId": "11111111-1111-1111-1111-111111111111",
+                    "positionId": "22222222-2222-2222-2222-222222222222",
+                    "playerName": "Existing Snapshot",
+                    "value": 4.6,
+                    "attackingAbility": 50,
+                    "defensiveAbility": 36,
+                    "kickingAbility": 61,
+                    "discipline": 70,
+                    "consistency": 76,
+                    "fitness": 86,
+                    "currentForm": 64,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("URC_PLAYERS_FILE", str(export))
+    install = fake_scrape([_make_player("Edinburgh Only")])
+
+    body = client.get("/players", params={"refresh": "true", "club": "edinburgh"}).json()
+
+    # Fresh data comes back, the club slug reached the scraper...
+    assert [player["playerName"] for player in body] == ["Edinburgh Only"]
+    assert install.calls == [("edinburgh", None)]
+    # ...but the canonical snapshot is untouched.
+    assert json.loads(export.read_text(encoding="utf-8"))[0]["playerName"] == (
+        "Existing Snapshot"
+    )
+
+
+def test_refresh_surfaces_scrape_failures_as_502(no_export, monkeypatch):
+    async def _boom(club, season):
+        raise ScraperError("site unreachable")
+
+    monkeypatch.setattr(players_api, "_scrape_players", _boom)
+
+    response = client.get("/players", params={"refresh": "true"})
+
+    assert response.status_code == 502
+    assert "site unreachable" in response.json()["detail"]
