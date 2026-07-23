@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+beautifulsoup4
+lxml
+httpx
+pydantic-settings
+python-dotenv
+curl_cffi
